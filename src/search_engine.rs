@@ -39,6 +39,7 @@ impl SearchEngine {
     }
 
     /// Build a full search URL for the given query string.
+    #[must_use]
     pub fn build_url(&self, query: &str) -> String {
         self.url_template.replace("{query}", &url_encode(query))
     }
@@ -54,6 +55,7 @@ pub struct SearchEngineRegistry;
 
 impl SearchEngineRegistry {
     /// All built-in search engines, in display order.
+    #[must_use]
     pub fn all() -> Vec<SearchEngine> {
         vec![
             SearchEngine::new(
@@ -86,6 +88,7 @@ impl SearchEngineRegistry {
     }
 
     /// Find an engine by ID, falling back to Brave Search.
+    #[must_use]
     pub fn find(id: &str) -> SearchEngine {
         Self::all()
             .into_iter()
@@ -123,6 +126,7 @@ impl Default for BrowserConfig {
 }
 
 impl BrowserConfig {
+    #[must_use]
     pub fn load() -> Self {
         let path = config_path();
         std::fs::read_to_string(&path)
@@ -142,11 +146,13 @@ impl BrowserConfig {
     }
 
     /// Returns the currently configured [`SearchEngine`].
+    #[must_use]
     pub fn active_engine(&self) -> SearchEngine {
         SearchEngineRegistry::find(&self.search_engine)
     }
 
     /// Build a search URL using the configured engine.
+    #[must_use]
     pub fn build_search_url(&self, query: &str) -> String {
         self.active_engine().build_url(query)
     }

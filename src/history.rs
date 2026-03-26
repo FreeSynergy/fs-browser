@@ -8,6 +8,7 @@ pub fn clear(history: &mut Vec<HistoryEntry>) {
 }
 
 /// Return the last N entries (most recent first).
+#[must_use]
 pub fn recent(history: &[HistoryEntry], limit: usize) -> Vec<&HistoryEntry> {
     history.iter().rev().take(limit).collect()
 }

@@ -1,3 +1,4 @@
+#![deny(clippy::all, clippy::pedantic, warnings)]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

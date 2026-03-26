@@ -1,6 +1,16 @@
 // Bookmark + History CRUD backed by fs-db (browser.db).
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use crate::model::{Bookmark, HistoryEntry};
+
+/// Monotonically increasing in-memory ID source.
+/// Once persisted to fs-db the database will own ID generation.
+static NEXT_ID: AtomicI64 = AtomicI64::new(1);
+
+fn next_id() -> i64 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 // ── BookmarkManager ───────────────────────────────────────────────────────────
 
@@ -8,10 +18,10 @@ pub struct BookmarkManager;
 
 impl BookmarkManager {
     /// Add a bookmark. No-op if already bookmarked (same URL).
+    #[must_use]
     pub fn add(title: &str, url: &str) -> Option<Bookmark> {
-        let id = chrono::Utc::now().timestamp_millis();
         Some(Bookmark {
-            id,
+            id: next_id(),
             title: title.to_string(),
             url: url.to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -24,9 +34,10 @@ impl BookmarkManager {
     }
 
     /// Record a history visit. Adds a new entry; duplicates are kept for full history.
+    #[must_use]
     pub fn record_visit(title: &str, url: &str) -> HistoryEntry {
         HistoryEntry {
-            id: chrono::Utc::now().timestamp_millis(),
+            id: next_id(),
             title: title.to_string(),
             url: url.to_string(),
             visited_at: chrono::Utc::now().to_rfc3339(),

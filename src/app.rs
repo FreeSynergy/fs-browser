@@ -306,7 +306,7 @@ pub fn BrowserApp() -> Element {
                                         navigate_to(&mut tabs, *active_tab.read(), &url, &mut history, &mut address_input);
                                         panel.set(BrowserPanel::Browse);
                                     },
-                                    on_clear: move |_| {
+                                    on_clear: move |()| {
                                         crate::history::clear(&mut history.write());
                                     },
                                 }
@@ -513,7 +513,7 @@ fn normalize_url(input: &str, config: &BrowserConfig) -> String {
 
 // ── CSS ───────────────────────────────────────────────────────────────────────
 
-const BROWSER_CSS: &str = r#"
+const BROWSER_CSS: &str = r"
 .fs-browser {
     display: flex;
     flex-direction: column;
@@ -721,4 +721,4 @@ const BROWSER_CSS: &str = r#"
 .fs-browser__panel-row-action:hover {
     background: var(--fs-color-bg-elevated);
 }
-"#;
+";

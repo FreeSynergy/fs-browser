@@ -13,6 +13,7 @@ pub struct BrowserTab {
 }
 
 impl BrowserTab {
+    #[must_use]
     pub fn new(id: u32) -> Self {
         Self {
             id,
@@ -22,10 +23,11 @@ impl BrowserTab {
         }
     }
 
+    #[must_use]
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
         let url = url.into();
-        self.title = url.clone();
-        self.url = url;
+        self.url.clone_from(&url);
+        self.title = url;
         self
     }
 
@@ -81,6 +83,7 @@ pub enum DownloadStatus {
 }
 
 impl DownloadStatus {
+    #[must_use]
     pub fn label(&self) -> &str {
         match self {
             Self::Pending => "Pending",
