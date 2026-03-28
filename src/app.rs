@@ -1,502 +1,475 @@
-// Browser app — URL bar + iframe + tabs + bookmarks + history.
+// fs-browser/src/app.rs — iced-based browser application.
 //
-// K1: Browser-View (URL bar, iframe rendering, tabs)
-// K2: Download handler → S3 /shared/downloads/ (intercepted via URL pattern)
-// K3: Service integration — accepts a `service_url` context set by Conductor
-// K4: Bookmarks + History (in-memory, to be persisted via fs-db in production)
+// Uses fs-gui-engine-iced (and thus fs-render) as the GUI layer.
+// Imports fs-web-engine for WebView/WebEngine abstractions.
+// No Dioxus dependency.
 
-use dioxus::prelude::*;
-use fs_components::FS_SIDEBAR_CSS;
-use fs_i18n;
+use fs_gui_engine_iced::iced::{
+    self,
+    widget::{button, column, container, row, scrollable, text, text_input, Space},
+    Alignment, Element, Length, Task,
+};
+use fs_web_engine::{
+    stub::StubWebEngine,
+    view::{WebView, WebViewConfig},
+    WebEngine,
+};
 
 use crate::bookmarks::BookmarkManager;
 use crate::model::{Bookmark, BrowserTab, DownloadEntry, HistoryEntry};
 use crate::search_engine::BrowserConfig;
 
-// ── Browser sections ──────────────────────────────────────────────────────────
+// ── BrowserPanel ──────────────────────────────────────────────────────────────
 
-#[derive(Clone, PartialEq, Debug)]
-enum BrowserPanel {
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BrowserPanel {
+    #[default]
     Browse,
     Bookmarks,
     History,
     Downloads,
 }
 
-// ── Context: external apps can request opening a URL ─────────────────────────
+// ── Message ───────────────────────────────────────────────────────────────────
 
-/// Set this context from outside (e.g. Conductor) to open a URL in the browser.
-pub type BrowserUrlRequest = Signal<Option<String>>;
+/// Browser application messages.
+#[derive(Debug, Clone)]
+pub enum Message {
+    AddressChanged(String),
+    Navigate,
+    NavigateTo(String),
+    Reload,
+    TabSelected(u32),
+    TabClosed(u32),
+    NewTab,
+    PanelToggled(BrowserPanel),
+    BookmarkCurrent,
+    BookmarkRemoved(i64),
+    HistoryCleared,
+    Noop,
+}
 
 // ── BrowserApp ────────────────────────────────────────────────────────────────
 
-/// Root browser component.
-#[component]
-pub fn BrowserApp() -> Element {
-    // Tabs state
-    let mut tabs: Signal<Vec<BrowserTab>> = use_signal(|| vec![BrowserTab::new(1)]);
-    let mut active_tab: Signal<u32> = use_signal(|| 1);
-    let mut next_tab_id: Signal<u32> = use_signal(|| 2);
-
-    // Address bar input (reflects active tab's url while typing)
-    let mut address_input: Signal<String> = use_signal(String::new);
-
-    // Side panel
-    let mut panel: Signal<BrowserPanel> = use_signal(|| BrowserPanel::Browse);
-
-    // K4: Bookmarks + History (in-memory)
-    let mut bookmarks: Signal<Vec<Bookmark>> = use_signal(Vec::new);
-    let mut history: Signal<Vec<HistoryEntry>> = use_signal(Vec::new);
-    let downloads: Signal<Vec<DownloadEntry>> = use_signal(Vec::new);
-
-    // Browser config (search engine)
-    let browser_config: Signal<BrowserConfig> = use_signal(BrowserConfig::load);
-
-    // Status message (bookmark added/removed feedback)
-    let mut status_msg: Signal<Option<String>> = use_signal(|| None);
-
-    // K3: Accept service URL requests from Conductor via context
-    // try_consume_context returns None if no BrowserUrlRequest was provided upstream.
-    let url_request: Option<BrowserUrlRequest> = try_consume_context::<BrowserUrlRequest>();
-    use_effect(move || {
-        if let Some(mut req) = url_request {
-            let maybe_url = req.read().clone();
-            if let Some(url) = maybe_url {
-                navigate_to(
-                    &mut tabs,
-                    *active_tab.read(),
-                    &url,
-                    &mut history,
-                    &mut address_input,
-                );
-                *req.write() = None;
-            }
-        }
-    });
-
-    // Current active tab URL for iframe src
-    let current_url = tabs
-        .read()
-        .iter()
-        .find(|t| t.id == *active_tab.read())
-        .map(|t| t.url.clone())
-        .unwrap_or_default();
-
-    let current_url_for_reload = current_url.clone();
-    let show_panel = *panel.read() != BrowserPanel::Browse;
-
-    rsx! {
-        style { "{FS_SIDEBAR_CSS}" }
-        style { "{BROWSER_CSS}" }
-
-        div {
-            class: "fs-browser",
-
-            // ── Title bar ────────────────────────────────────────────────────
-            div {
-                class: "fs-browser__titlebar",
-                h2 {
-                    style: "margin: 0; font-size: 15px; font-weight: 600; color: var(--fs-color-text-primary);",
-                    {fs_i18n::t("browser.title")}
-                }
-            }
-
-            // ── Toolbar: nav + address bar + panel toggles ────────────────
-            div {
-                class: "fs-browser__toolbar",
-
-                // Nav buttons
-                button {
-                    class: "fs-browser__nav-btn",
-                    title: fs_i18n::t("browser.go_back").to_string(),
-                    onclick: move |_| {
-                        // Back navigation — in an iframe context use JS eval
-                        // For now: no-op (history management per-tab not trivial in iframe)
-                    },
-                    "‹"
-                }
-                button {
-                    class: "fs-browser__nav-btn",
-                    title: fs_i18n::t("browser.go_forward").to_string(),
-                    onclick: move |_| {},
-                    "›"
-                }
-                button {
-                    class: "fs-browser__nav-btn",
-                    title: fs_i18n::t("browser.reload").to_string(),
-                    onclick: move |_| {
-                        let url = normalize_url(&current_url_for_reload, &browser_config.read());
-                        navigate_to(&mut tabs, *active_tab.read(), &url, &mut history, &mut address_input);
-                    },
-                    "↺"
-                }
-
-                // Address bar
-                input {
-                    class: "fs-browser__address",
-                    r#type: "text",
-                    placeholder: fs_i18n::t("browser.url_placeholder").to_string(),
-                    value: "{address_input}",
-                    oninput: move |e| address_input.set(e.value()),
-                    onkeydown: move |e| {
-                        if e.key() == Key::Enter {
-                            let url = normalize_url(&address_input.read(), &browser_config.read());
-                            navigate_to(&mut tabs, *active_tab.read(), &url, &mut history, &mut address_input);
-                        }
-                    },
-                }
-
-                // Bookmark toggle
-                button {
-                    class: "fs-browser__nav-btn",
-                    title: fs_i18n::t("browser.bookmarks.add").to_string(),
-                    onclick: move |_| {
-                        let url = current_url.clone();
-                        if !url.is_empty() {
-                            if let Some(bm) = BookmarkManager::add(&url, &url) {
-                                bookmarks.write().push(bm);
-                                status_msg.set(Some(fs_i18n::t("browser.bookmarks.added").to_string()));
-                            }
-                        }
-                    },
-                    "☆"
-                }
-
-                // Panel toggles
-                button {
-                    class: if *panel.read() == BrowserPanel::Bookmarks { "fs-browser__nav-btn fs-browser__nav-btn--active" } else { "fs-browser__nav-btn" },
-                    title: fs_i18n::t("browser.bookmarks.label").to_string(),
-                    onclick: move |_| {
-                        let p = if *panel.read() == BrowserPanel::Bookmarks { BrowserPanel::Browse } else { BrowserPanel::Bookmarks };
-                        panel.set(p);
-                    },
-                    "🔖"
-                }
-                button {
-                    class: if *panel.read() == BrowserPanel::History { "fs-browser__nav-btn fs-browser__nav-btn--active" } else { "fs-browser__nav-btn" },
-                    title: fs_i18n::t("browser.history.label").to_string(),
-                    onclick: move |_| {
-                        let p = if *panel.read() == BrowserPanel::History { BrowserPanel::Browse } else { BrowserPanel::History };
-                        panel.set(p);
-                    },
-                    "⏱"
-                }
-                button {
-                    class: if *panel.read() == BrowserPanel::Downloads { "fs-browser__nav-btn fs-browser__nav-btn--active" } else { "fs-browser__nav-btn" },
-                    title: fs_i18n::t("browser.downloads.label").to_string(),
-                    onclick: move |_| {
-                        let p = if *panel.read() == BrowserPanel::Downloads { BrowserPanel::Browse } else { BrowserPanel::Downloads };
-                        panel.set(p);
-                    },
-                    "⬇"
-                }
-            }
-
-            // ── Tab bar ───────────────────────────────────────────────────
-            div {
-                class: "fs-browser__tabbar",
-
-                for tab in tabs.read().clone().iter() {
-                    div {
-                        key: "{tab.id}",
-                        class: if tab.id == *active_tab.read() { "fs-browser__tab fs-browser__tab--active" } else { "fs-browser__tab" },
-                        onclick: {
-                            let tab_id = tab.id;
-                            let url = tab.url.clone();
-                            move |_| {
-                                active_tab.set(tab_id);
-                                address_input.set(url.clone());
-                            }
-                        },
-                        span {
-                            class: "fs-browser__tab-title",
-                            "{tab.title}"
-                        }
-                        button {
-                            class: "fs-browser__tab-close",
-                            title: fs_i18n::t("browser.close_tab").to_string(),
-                            onclick: {
-                                let tab_id = tab.id;
-                                move |e: MouseEvent| {
-                                    e.stop_propagation();
-                                    close_tab(&mut tabs, &mut active_tab, tab_id);
-                                }
-                            },
-                            "✕"
-                        }
-                    }
-                }
-
-                // New tab button
-                button {
-                    class: "fs-browser__new-tab",
-                    title: fs_i18n::t("browser.new_tab").to_string(),
-                    onclick: move |_| {
-                        let id = *next_tab_id.read();
-                        next_tab_id.set(id + 1);
-                        tabs.write().push(BrowserTab::new(id));
-                        active_tab.set(id);
-                        address_input.set(String::new());
-                    },
-                    "+"
-                }
-            }
-
-            // ── Status message (transient) ────────────────────────────────
-            if let Some(msg) = status_msg.read().clone() {
-                div {
-                    class: "fs-browser__status",
-                    "{msg}"
-                }
-            }
-
-            // ── Content area: iframe + optional side panel ─────────────────
-            div {
-                class: "fs-browser__content",
-
-                // Main iframe viewport
-                div {
-                    class: "fs-browser__viewport",
-                    style: if show_panel { "min-width: 0;" } else { "" },
-
-                    if current_url.is_empty() {
-                        // Empty tab — show a welcome page
-                        div {
-                            class: "fs-browser__newtab",
-                            span { style: "font-size: 48px;", "🌐" }
-                            p {
-                                style: "color: var(--fs-color-text-muted); margin-top: 12px;",
-                                {fs_i18n::t("browser.url_placeholder")}
-                            }
-                        }
-                    } else {
-                        // K1: WebView via iframe (Dioxus desktop runs in Wry/WebView).
-                        // flex: 1 fills the flex-column parent; min-height: 0 prevents
-                        // the flex minimum-size heuristic from collapsing the iframe to 0.
-                        iframe {
-                            key: "{current_url}",
-                            src: "{current_url}",
-                            style: "flex: 1; min-height: 0; width: 100%; border: none; display: block;",
-                        }
-                    }
-                }
-
-                // Side panel (bookmarks / history / downloads)
-                if show_panel {
-                    div {
-                        class: "fs-browser__panel",
-
-                        match *panel.read() {
-                            BrowserPanel::Bookmarks => rsx! {
-                                BookmarksPanel {
-                                    bookmarks: bookmarks.read().clone(),
-                                    on_open: move |url: String| {
-                                        navigate_to(&mut tabs, *active_tab.read(), &url, &mut history, &mut address_input);
-                                        panel.set(BrowserPanel::Browse);
-                                    },
-                                    on_remove: move |id: i64| {
-                                        BookmarkManager::remove(&mut bookmarks.write(), id);
-                                    },
-                                }
-                            },
-                            BrowserPanel::History => rsx! {
-                                HistoryPanel {
-                                    history: history.read().clone(),
-                                    on_open: move |url: String| {
-                                        navigate_to(&mut tabs, *active_tab.read(), &url, &mut history, &mut address_input);
-                                        panel.set(BrowserPanel::Browse);
-                                    },
-                                    on_clear: move |()| {
-                                        crate::history::clear(&mut history.write());
-                                    },
-                                }
-                            },
-                            BrowserPanel::Downloads => rsx! {
-                                DownloadsPanel {
-                                    downloads: downloads.read().clone(),
-                                }
-                            },
-                            BrowserPanel::Browse => rsx! {},
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ── BookmarksPanel ────────────────────────────────────────────────────────────
-
-#[component]
-fn BookmarksPanel(
+/// `FreeSynergy` Browser application state (iced-based).
+pub struct BrowserApp {
+    tabs: Vec<BrowserTab>,
+    active_tab: u32,
+    next_tab_id: u32,
+    address_input: String,
+    panel: BrowserPanel,
     bookmarks: Vec<Bookmark>,
-    on_open: EventHandler<String>,
-    on_remove: EventHandler<i64>,
-) -> Element {
-    rsx! {
-        div { class: "fs-browser__panel-inner",
-            h3 { style: "margin: 0 0 12px; font-size: 14px;", {fs_i18n::t("browser.bookmarks.label")} }
-            if bookmarks.is_empty() {
-                p { style: "color: var(--fs-color-text-muted); font-size: 13px;",
-                    {fs_i18n::t("browser.bookmarks.empty")}
-                }
-            }
-            for bm in bookmarks.iter() {
-                div { key: "{bm.id}",
-                    class: "fs-browser__panel-row",
-                    div {
-                        class: "fs-browser__panel-row-main",
-                        onclick: {
-                            let url = bm.url.clone();
-                            move |_| on_open.call(url.clone())
-                        },
-                        span {
-                            style: "font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                            "{bm.title}"
-                        }
-                    }
-                    button {
-                        class: "fs-browser__panel-row-action",
-                        onclick: {
-                            let id = bm.id;
-                            move |_| on_remove.call(id)
-                        },
-                        title: fs_i18n::t("browser.bookmarks.remove").to_string(),
-                        "✕"
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ── HistoryPanel ──────────────────────────────────────────────────────────────
-
-#[component]
-fn HistoryPanel(
     history: Vec<HistoryEntry>,
-    on_open: EventHandler<String>,
-    on_clear: EventHandler<()>,
-) -> Element {
-    rsx! {
-        div { class: "fs-browser__panel-inner",
-            div { style: "display: flex; align-items: center; gap: 8px; margin-bottom: 12px;",
-                h3 { style: "margin: 0; flex: 1; font-size: 14px;", {fs_i18n::t("browser.history.label")} }
-                button {
-                    class: "fs-browser__panel-row-action",
-                    onclick: move |_| on_clear.call(()),
-                    {fs_i18n::t("browser.history.clear")}
+    downloads: Vec<DownloadEntry>,
+    config: BrowserConfig,
+    status_msg: Option<String>,
+    // Web engine — stub by default; replace with ServoWebEngine when G2.6 is done.
+    engine: Box<dyn WebEngine>,
+    web_view: Box<dyn WebView>,
+}
+
+impl std::fmt::Debug for BrowserApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserApp")
+            .field("tabs", &self.tabs)
+            .field("active_tab", &self.active_tab)
+            .field("next_tab_id", &self.next_tab_id)
+            .field("address_input", &self.address_input)
+            .field("panel", &self.panel)
+            .field("bookmarks", &self.bookmarks)
+            .field("history", &self.history)
+            .field("downloads", &self.downloads)
+            .field("config", &self.config)
+            .field("status_msg", &self.status_msg)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for BrowserApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BrowserApp {
+    /// Create a new browser with one empty tab.
+    pub fn new() -> Self {
+        let config = BrowserConfig::load();
+        let engine: Box<dyn WebEngine> = Box::new(StubWebEngine::new());
+        let web_view = engine.create_view(WebViewConfig::new("tab-1"));
+        Self {
+            tabs: vec![BrowserTab::new(1)],
+            active_tab: 1,
+            next_tab_id: 2,
+            address_input: String::new(),
+            panel: BrowserPanel::Browse,
+            bookmarks: Vec::new(),
+            history: Vec::new(),
+            downloads: Vec::new(),
+            config,
+            status_msg: None,
+            engine,
+            web_view,
+        }
+    }
+
+    // ── Update ────────────────────────────────────────────────────────────────
+
+    /// Handle a browser message and return the next task.
+    pub fn update(&mut self, msg: Message) -> Task<Message> {
+        match msg {
+            Message::AddressChanged(s) => {
+                self.address_input = s;
+            }
+            Message::Navigate => {
+                let url = normalize_url(&self.address_input, &self.config);
+                self.navigate_to(url);
+            }
+            Message::NavigateTo(url) => {
+                self.navigate_to(url.clone());
+                self.address_input = url;
+            }
+            Message::Reload => {
+                let url = self.current_url().to_string();
+                if !url.is_empty() {
+                    self.engine.reload(self.web_view.view_id());
+                    self.navigate_to(url);
                 }
             }
-            if history.is_empty() {
-                p { style: "color: var(--fs-color-text-muted); font-size: 13px;",
-                    {fs_i18n::t("browser.history.empty")}
-                }
+            Message::TabSelected(id) => {
+                self.active_tab = id;
+                let url = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.url.clone())
+                    .unwrap_or_default();
+                self.address_input = url;
             }
-            for entry in crate::history::recent(&history, 100).into_iter() {
-                div { key: "{entry.id}",
-                    class: "fs-browser__panel-row",
-                    div {
-                        class: "fs-browser__panel-row-main",
-                        onclick: {
-                            let url = entry.url.clone();
-                            move |_| on_open.call(url.clone())
-                        },
-                        span { style: "font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                            "{entry.title}"
-                        }
-                        span { style: "font-size: 11px; color: var(--fs-color-text-muted);",
-                            " — {entry.visited_at}"
-                        }
+            Message::TabClosed(id) => {
+                self.close_tab(id);
+            }
+            Message::NewTab => {
+                let id = self.next_tab_id;
+                self.next_tab_id += 1;
+                self.tabs.push(BrowserTab::new(id));
+                self.active_tab = id;
+                self.address_input = String::new();
+                // Create a new WebView for the tab.
+                let view_id = format!("tab-{id}");
+                self.web_view = self.engine.create_view(WebViewConfig::new(view_id));
+            }
+            Message::PanelToggled(p) => {
+                self.panel = if self.panel == p {
+                    BrowserPanel::Browse
+                } else {
+                    p
+                };
+            }
+            Message::BookmarkCurrent => {
+                let url = self.current_url().to_string();
+                if !url.is_empty() {
+                    if let Some(bm) = BookmarkManager::add(&url, &url) {
+                        self.bookmarks.push(bm);
+                        self.status_msg = Some("Bookmark added".to_string());
                     }
                 }
             }
-        }
-    }
-}
-
-// ── DownloadsPanel ────────────────────────────────────────────────────────────
-
-#[component]
-fn DownloadsPanel(downloads: Vec<DownloadEntry>) -> Element {
-    rsx! {
-        div { class: "fs-browser__panel-inner",
-            h3 { style: "margin: 0 0 12px; font-size: 14px;", {fs_i18n::t("browser.downloads.label")} }
-            if downloads.is_empty() {
-                p { style: "color: var(--fs-color-text-muted); font-size: 13px;",
-                    {fs_i18n::t("browser.downloads.empty")}
-                }
+            Message::BookmarkRemoved(id) => {
+                BookmarkManager::remove(&mut self.bookmarks, id);
             }
-            for dl in downloads.iter() {
-                div { key: "{dl.id}",
-                    class: "fs-browser__panel-row",
-                    div { class: "fs-browser__panel-row-main",
-                        span { style: "font-size: 13px;", "{dl.filename}" }
-                        span { style: "font-size: 11px; color: var(--fs-color-text-muted);",
-                            " → {dl.s3_path}"
-                        }
-                    }
-                    span {
-                        style: "font-size: 12px; color: var(--fs-color-text-muted); white-space: nowrap;",
-                        "{dl.status.label()}"
-                    }
-                }
+            Message::HistoryCleared => {
+                crate::history::clear(&mut self.history);
+            }
+            Message::Noop => {}
+        }
+        Task::none()
+    }
+
+    // ── View ──────────────────────────────────────────────────────────────────
+
+    /// Render the browser UI.
+    pub fn view(&self) -> Element<'_, Message> {
+        let show_panel = self.panel != BrowserPanel::Browse;
+
+        column![
+            Self::view_titlebar(),
+            self.view_toolbar(),
+            self.view_tabbar(),
+            self.view_status(),
+            row![
+                self.view_viewport(show_panel),
+                if show_panel {
+                    self.view_panel()
+                } else {
+                    Space::with_width(0).into()
+                },
+            ]
+            .height(Length::Fill),
+        ]
+        .into()
+    }
+
+    fn view_titlebar() -> Element<'static, Message> {
+        container(text("FreeSynergy Browser").size(15))
+            .width(Length::Fill)
+            .padding(8)
+            .into()
+    }
+
+    fn view_toolbar(&self) -> Element<'_, Message> {
+        let nav_btn = |label: &'static str, msg: Message| {
+            button(text(label).size(16)).on_press(msg).padding([4, 8])
+        };
+
+        row![
+            nav_btn("‹", Message::Noop),
+            nav_btn("›", Message::Noop),
+            nav_btn("↺", Message::Reload),
+            text_input("Enter URL or search…", &self.address_input)
+                .on_input(Message::AddressChanged)
+                .on_submit(Message::Navigate)
+                .padding(6)
+                .width(Length::Fill),
+            nav_btn("☆", Message::BookmarkCurrent),
+            button(text("🔖").size(14))
+                .on_press(Message::PanelToggled(BrowserPanel::Bookmarks))
+                .padding([4, 8]),
+            button(text("⏱").size(14))
+                .on_press(Message::PanelToggled(BrowserPanel::History))
+                .padding([4, 8]),
+            button(text("⬇").size(14))
+                .on_press(Message::PanelToggled(BrowserPanel::Downloads))
+                .padding([4, 8]),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .padding(6)
+        .into()
+    }
+
+    fn view_tabbar(&self) -> Element<'_, Message> {
+        let tabs: Vec<Element<Message>> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let is_active = tab.id == self.active_tab;
+                let tab_id = tab.id;
+                let label = tab.title.chars().take(20).collect::<String>();
+                row![
+                    button(text(label).size(12))
+                        .on_press(Message::TabSelected(tab_id))
+                        .padding([4, 10])
+                        .style(if is_active {
+                            iced::widget::button::primary
+                        } else {
+                            iced::widget::button::secondary
+                        }),
+                    button(text("✕").size(10))
+                        .on_press(Message::TabClosed(tab_id))
+                        .padding([4, 6]),
+                ]
+                .spacing(0)
+                .into()
+            })
+            .collect();
+
+        let mut tab_row = row(tabs).spacing(2);
+        tab_row = tab_row.push(
+            button(text("+").size(16))
+                .on_press(Message::NewTab)
+                .padding([3, 10]),
+        );
+
+        container(tab_row.padding(4)).width(Length::Fill).into()
+    }
+
+    fn view_status(&self) -> Element<'_, Message> {
+        if let Some(msg) = &self.status_msg {
+            container(text(msg.as_str()).size(11))
+                .width(Length::Fill)
+                .padding([2, 16])
+                .into()
+        } else {
+            Space::with_height(0).into()
+        }
+    }
+
+    fn view_viewport(&self, _show_panel: bool) -> Element<'_, Message> {
+        let url = self.current_url();
+        let content: Element<Message> = if url.is_empty() {
+            column![
+                text("🌐").size(48),
+                text("Enter a URL or search term above").size(14),
+            ]
+            .spacing(12)
+            .align_x(Alignment::Center)
+            .into()
+        } else {
+            // Placeholder — real rendering via fs-web-engine-servo (G2.6).
+            column![
+                text(format!("Loading: {url}")).size(13),
+                text("(Web engine not yet connected — G2.6)").size(11),
+            ]
+            .spacing(8)
+            .padding(16)
+            .into()
+        };
+
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(8)
+            .into()
+    }
+
+    fn view_panel(&self) -> Element<'_, Message> {
+        let content: Element<Message> = match self.panel {
+            BrowserPanel::Bookmarks => self.view_bookmarks_panel(),
+            BrowserPanel::History => self.view_history_panel(),
+            BrowserPanel::Downloads => self.view_downloads_panel(),
+            BrowserPanel::Browse => Space::with_width(0).into(),
+        };
+        container(scrollable(content))
+            .width(280)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn view_bookmarks_panel(&self) -> Element<'_, Message> {
+        let items: Vec<Element<Message>> = self
+            .bookmarks
+            .iter()
+            .map(|bm| {
+                let url = bm.url.clone();
+                let id = bm.id;
+                row![
+                    button(text(bm.title.chars().take(30).collect::<String>()).size(12))
+                        .on_press(Message::NavigateTo(url))
+                        .style(iced::widget::button::text)
+                        .width(Length::Fill),
+                    button(text("✕").size(10))
+                        .on_press(Message::BookmarkRemoved(id))
+                        .padding([2, 6]),
+                ]
+                .spacing(4)
+                .into()
+            })
+            .collect();
+
+        let empty = self.bookmarks.is_empty();
+        let mut col = column![text("Bookmarks").size(14)].spacing(4).padding(12);
+        if empty {
+            col = col.push(text("No bookmarks yet").size(12));
+        } else {
+            for item in items {
+                col = col.push(item);
+            }
+        }
+        col.into()
+    }
+
+    fn view_history_panel(&self) -> Element<'_, Message> {
+        let recent = crate::history::recent(&self.history, 50);
+        let items: Vec<Element<Message>> = recent
+            .into_iter()
+            .map(|entry| {
+                let url = entry.url.clone();
+                button(text(entry.title.chars().take(30).collect::<String>()).size(12))
+                    .on_press(Message::NavigateTo(url))
+                    .style(iced::widget::button::text)
+                    .width(Length::Fill)
+                    .into()
+            })
+            .collect();
+
+        let mut col = column![row![
+            text("History").size(14).width(Length::Fill),
+            button(text("Clear").size(11))
+                .on_press(Message::HistoryCleared)
+                .padding([2, 8]),
+        ],]
+        .spacing(4)
+        .padding(12);
+
+        if items.is_empty() {
+            col = col.push(text("No history yet").size(12));
+        } else {
+            for item in items {
+                col = col.push(item);
+            }
+        }
+        col.into()
+    }
+
+    fn view_downloads_panel(&self) -> Element<'_, Message> {
+        let items: Vec<Element<Message>> = self
+            .downloads
+            .iter()
+            .map(|dl| {
+                row![
+                    text(dl.filename.chars().take(24).collect::<String>())
+                        .size(12)
+                        .width(Length::Fill),
+                    text(dl.status.label()).size(11),
+                ]
+                .spacing(8)
+                .into()
+            })
+            .collect();
+
+        let mut col = column![text("Downloads").size(14)].spacing(4).padding(12);
+        if items.is_empty() {
+            col = col.push(text("No downloads").size(12));
+        } else {
+            for item in items {
+                col = col.push(item);
+            }
+        }
+        col.into()
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn current_url(&self) -> &str {
+        self.tabs
+            .iter()
+            .find(|t| t.id == self.active_tab)
+            .map_or("", |t| t.url.as_str())
+    }
+
+    fn navigate_to(&mut self, url: String) {
+        self.address_input.clone_from(&url);
+        self.web_view.navigate(&url);
+        self.history.push(BookmarkManager::record_visit(&url, &url));
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == self.active_tab) {
+            tab.navigate(url);
+        }
+    }
+
+    fn close_tab(&mut self, id: u32) {
+        if self.tabs.len() <= 1 {
+            if let Some(t) = self.tabs.first_mut() {
+                t.reset();
+                self.web_view = self.engine.create_view(WebViewConfig::new("tab-1"));
+            }
+            return;
+        }
+        let idx = self.tabs.iter().position(|t| t.id == id).unwrap_or(0);
+        self.tabs.remove(idx);
+        if self.active_tab == id {
+            let new_idx = idx.saturating_sub(1).min(self.tabs.len() - 1);
+            if let Some(t) = self.tabs.get(new_idx) {
+                self.active_tab = t.id;
+                self.address_input = t.url.clone();
             }
         }
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── URL helpers ───────────────────────────────────────────────────────────────
 
-/// Navigate the active tab to `url`.
-fn navigate_to(
-    tabs: &mut Signal<Vec<BrowserTab>>,
-    tab_id: u32,
-    url: &str,
-    history: &mut Signal<Vec<HistoryEntry>>,
-    address: &mut Signal<String>,
-) {
-    // navigate_to is called with already-normalized URLs; keep as-is.
-    let url = url.to_string();
-    address.set(url.clone());
-    history
-        .write()
-        .push(BookmarkManager::record_visit(&url, &url));
-
-    if let Some(tab) = tabs.write().iter_mut().find(|t| t.id == tab_id) {
-        tab.navigate(url);
-    }
-}
-
-/// Close a tab; switch to the adjacent one if the closed tab was active.
-fn close_tab(tabs: &mut Signal<Vec<BrowserTab>>, active: &mut Signal<u32>, id: u32) {
-    let len = tabs.read().len();
-    if len <= 1 {
-        // Always keep at least one tab; reset it instead
-        if let Some(t) = tabs.write().first_mut() {
-            t.reset();
-        }
-        return;
-    }
-
-    let idx = tabs.read().iter().position(|t| t.id == id).unwrap_or(0);
-    tabs.write().remove(idx);
-
-    if *active.read() == id {
-        let new_idx = idx
-            .saturating_sub(1)
-            .min(tabs.read().len().saturating_sub(1));
-        if let Some(t) = tabs.read().get(new_idx) {
-            active.set(t.id);
-        }
-    }
-}
-
-/// Normalize an address bar input to a URL.
-///
-/// - Already a URL (has scheme) → returned as-is
-/// - Looks like a domain (`foo.com`) → prepend `https://`
-/// - Anything else → treat as search query, build URL via configured engine
+/// Normalize address-bar input to a URL.
 fn normalize_url(input: &str, config: &BrowserConfig) -> String {
     let t = input.trim();
     if t.is_empty() {
@@ -511,214 +484,96 @@ fn normalize_url(input: &str, config: &BrowserConfig) -> String {
     }
 }
 
-// ── CSS ───────────────────────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
-const BROWSER_CSS: &str = r"
-.fs-browser {
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-    width: 100%;
-    overflow: hidden;
-    background: var(--fs-color-bg-base);
-    font-family: var(--fs-font-family, system-ui, sans-serif);
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-.fs-browser__titlebar {
-    padding: 8px 16px;
-    border-bottom: 1px solid var(--fs-color-border-default);
-    flex-shrink: 0;
-    background: var(--fs-color-bg-surface);
-}
+    #[test]
+    fn new_app_has_one_tab() {
+        let app = BrowserApp::new();
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab, 1);
+    }
 
-.fs-browser__toolbar {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 6px 8px;
-    border-bottom: 1px solid var(--fs-color-border-default);
-    background: var(--fs-color-bg-surface);
-    flex-shrink: 0;
-}
+    #[test]
+    fn navigate_updates_tab_url() {
+        let mut app = BrowserApp::new();
+        app.address_input = "https://freesynergy.net".into();
+        let _ = app.update(Message::Navigate);
+        assert_eq!(app.current_url(), "https://freesynergy.net");
+    }
 
-.fs-browser__nav-btn {
-    background: transparent;
-    border: none;
-    color: var(--fs-color-text-muted);
-    font-size: 16px;
-    cursor: pointer;
-    padding: 4px 8px;
-    border-radius: 4px;
-    transition: background 100ms;
-    white-space: nowrap;
-}
-.fs-browser__nav-btn:hover {
-    background: var(--fs-color-bg-elevated);
-}
-.fs-browser__nav-btn--active {
-    color: var(--fs-color-primary, #06b6d4);
-}
+    #[test]
+    fn new_tab_increments_count() {
+        let mut app = BrowserApp::new();
+        let _ = app.update(Message::NewTab);
+        assert_eq!(app.tabs.len(), 2);
+    }
 
-.fs-browser__address {
-    flex: 1;
-    background: var(--fs-color-bg-base);
-    border: 1px solid var(--fs-color-border-default);
-    border-radius: 6px;
-    color: var(--fs-color-text-primary);
-    font-size: 13px;
-    padding: 5px 10px;
-    outline: none;
-    transition: border-color 150ms;
-}
-.fs-browser__address:focus {
-    border-color: var(--fs-color-primary, #06b6d4);
-}
+    #[test]
+    fn close_last_tab_resets_instead_of_removing() {
+        let mut app = BrowserApp::new();
+        let _ = app.update(Message::Navigate);
+        let _ = app.update(Message::TabClosed(1));
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.tabs[0].url.is_empty());
+    }
 
-.fs-browser__tabbar {
-    display: flex;
-    align-items: center;
-    gap: 2px;
-    padding: 4px 8px 0;
-    background: var(--fs-color-bg-surface);
-    border-bottom: 1px solid var(--fs-color-border-default);
-    overflow-x: auto;
-    flex-shrink: 0;
-}
+    #[test]
+    fn close_tab_switches_to_adjacent() {
+        let mut app = BrowserApp::new();
+        let _ = app.update(Message::NewTab);
+        assert_eq!(app.tabs.len(), 2);
+        let second_id = app.tabs[1].id;
+        let _ = app.update(Message::TabClosed(second_id));
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab, 1);
+    }
 
-.fs-browser__tab {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 5px 10px;
-    border-radius: 6px 6px 0 0;
-    cursor: pointer;
-    font-size: 12px;
-    max-width: 160px;
-    color: var(--fs-color-text-muted);
-    background: transparent;
-    transition: background 100ms;
-    white-space: nowrap;
-}
-.fs-browser__tab:hover {
-    background: var(--fs-color-bg-elevated);
-}
-.fs-browser__tab--active {
-    background: var(--fs-color-bg-base);
-    color: var(--fs-color-text-primary);
-    border-bottom: 2px solid var(--fs-color-primary, #06b6d4);
-}
+    #[test]
+    fn bookmark_added_to_list() {
+        let mut app = BrowserApp::new();
+        let _ = app.update(Message::NavigateTo("https://example.com".into()));
+        let _ = app.update(Message::BookmarkCurrent);
+        assert_eq!(app.bookmarks.len(), 1);
+    }
 
-.fs-browser__tab-title {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 110px;
-}
+    #[test]
+    fn history_recorded_on_navigate() {
+        let mut app = BrowserApp::new();
+        let _ = app.update(Message::NavigateTo("https://example.com".into()));
+        assert_eq!(app.history.len(), 1);
+    }
 
-.fs-browser__tab-close {
-    background: transparent;
-    border: none;
-    color: var(--fs-color-text-muted);
-    cursor: pointer;
-    font-size: 10px;
-    padding: 0 2px;
-    border-radius: 3px;
-    flex-shrink: 0;
-}
-.fs-browser__tab-close:hover {
-    background: rgba(239,68,68,0.2);
-    color: #ef4444;
-}
+    #[test]
+    fn history_cleared() {
+        let mut app = BrowserApp::new();
+        let _ = app.update(Message::NavigateTo("https://example.com".into()));
+        let _ = app.update(Message::HistoryCleared);
+        assert!(app.history.is_empty());
+    }
 
-.fs-browser__new-tab {
-    background: transparent;
-    border: none;
-    color: var(--fs-color-text-muted);
-    cursor: pointer;
-    font-size: 18px;
-    padding: 2px 8px;
-    border-radius: 4px;
-    flex-shrink: 0;
-}
-.fs-browser__new-tab:hover {
-    background: var(--fs-color-bg-elevated);
-}
+    #[test]
+    fn normalize_url_prepends_https_for_domain() {
+        let cfg = BrowserConfig::default();
+        assert_eq!(normalize_url("example.com", &cfg), "https://example.com");
+    }
 
-.fs-browser__status {
-    padding: 4px 16px;
-    font-size: 11px;
-    color: var(--fs-color-primary, #06b6d4);
-    background: var(--fs-color-bg-surface);
-    flex-shrink: 0;
-}
+    #[test]
+    fn normalize_url_passthrough_for_full_url() {
+        let cfg = BrowserConfig::default();
+        assert_eq!(
+            normalize_url("https://example.com/path", &cfg),
+            "https://example.com/path"
+        );
+    }
 
-.fs-browser__content {
-    display: flex;
-    flex: 1;
-    min-height: 0;
-    overflow: hidden;
+    #[test]
+    fn normalize_url_builds_search_url_for_terms() {
+        let cfg = BrowserConfig::default();
+        let url = normalize_url("freeSynergy platform", &cfg);
+        assert!(url.contains("freeSynergy"), "url={url}");
+    }
 }
-
-.fs-browser__viewport {
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-height: 0;
-    overflow: hidden;
-}
-
-.fs-browser__newtab {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    height: 100%;
-    color: var(--fs-color-text-muted);
-}
-
-.fs-browser__panel {
-    width: 280px;
-    flex-shrink: 0;
-    border-left: 1px solid var(--fs-color-border-default);
-    background: var(--fs-color-bg-surface);
-    overflow-y: auto;
-}
-
-.fs-browser__panel-inner {
-    padding: 16px;
-}
-
-.fs-browser__panel-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 0;
-    border-bottom: 1px solid var(--fs-color-border-subtle, rgba(255,255,255,0.05));
-}
-
-.fs-browser__panel-row-main {
-    flex: 1;
-    min-width: 0;
-    cursor: pointer;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-}
-.fs-browser__panel-row-main:hover span:first-child {
-    color: var(--fs-color-primary, #06b6d4);
-}
-
-.fs-browser__panel-row-action {
-    background: transparent;
-    border: none;
-    color: var(--fs-color-text-muted);
-    cursor: pointer;
-    font-size: 11px;
-    padding: 2px 6px;
-    border-radius: 4px;
-    white-space: nowrap;
-}
-.fs-browser__panel-row-action:hover {
-    background: var(--fs-color-bg-elevated);
-}
-";

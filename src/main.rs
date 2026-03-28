@@ -1,14 +1,20 @@
 #![deny(clippy::all, clippy::pedantic, warnings)]
-#[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// FreeSynergy Browser — iced-based standalone launcher.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "iced-gui")]
+fn main() -> fs_gui_engine_iced::iced::Result {
+    use fs_browser::app::{BrowserApp, Message};
+    fs_gui_engine_iced::IcedEngine::run::<BrowserApp, Message, _, _>(
+        "FreeSynergy Browser",
+        BrowserApp::update,
+        BrowserApp::view,
+    )
+}
+
+#[cfg(not(feature = "iced-gui"))]
 fn main() {
-    #[cfg(feature = "desktop")]
-    fs_components::launch_desktop(
-        fs_components::DesktopConfig::new()
-            .with_title("FS Browser")
-            .with_size(1100.0, 750.0)
-            .with_all_navigation(),
-        fs_browser::BrowserApp,
-    );
+    eprintln!("No GUI feature enabled. Build with --features iced-gui");
 }
