@@ -29,6 +29,7 @@
 
 pub mod bookmark;
 pub mod cli;
+pub mod config;
 pub mod controller;
 pub mod grpc;
 pub mod keys;
@@ -37,6 +38,7 @@ pub mod rest;
 pub mod view;
 
 pub use bookmark::{Bookmark, BookmarkStore, InMemoryBookmarkStore};
+pub use config::{BrowserConfig, SearchEngine, SearchEngineRegistry};
 pub use controller::BrowserController;
 pub use model::{BrowserModel, HistoryEntry};
 pub use view::BrowserView;
