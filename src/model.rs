@@ -1,97 +1,75 @@
-// Browser data model: tabs, bookmarks, history entries.
+// model.rs — BrowserModel: the current state of the browser.
+//
+// BrowserModel is the "M" in MVC.  It holds all observable state — current URL,
+// page title, loading flag, and the navigation history.  Bookmarks are managed
+// via BrowserController / BookmarkStore and passed in when the view needs them.
 
+use fs_web_engine::NavigationHistory;
 use serde::{Deserialize, Serialize};
 
-/// A single browser tab.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BrowserTab {
-    pub id: u32,
-    pub title: String,
-    pub url: String,
-    /// `true` while the page is loading.
+use crate::bookmark::Bookmark;
+
+// ── BrowserModel ──────────────────────────────────────────────────────────────
+
+/// Observable state of the browser.
+#[derive(Debug, Clone, Default)]
+pub struct BrowserModel {
+    /// The URL that is currently loaded (or being loaded).
+    pub current_url: Option<String>,
+    /// The `<title>` of the current page.
+    pub current_title: Option<String>,
+    /// Whether a page is currently being loaded.
     pub loading: bool,
+    /// Linear navigation history (back / forward stack).
+    pub history: NavigationHistory,
+    /// Snapshot of bookmarks (refreshed by the controller when needed).
+    pub bookmarks: Vec<Bookmark>,
 }
 
-impl BrowserTab {
+impl BrowserModel {
+    /// Create a blank browser state.
     #[must_use]
-    pub fn new(id: u32) -> Self {
-        Self {
-            id,
-            title: "New Tab".to_string(),
-            url: String::new(),
-            loading: false,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    #[must_use]
-    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+    /// Record that a URL has started loading.
+    pub fn set_loading(&mut self, url: impl Into<String>) {
         let url = url.into();
-        self.url.clone_from(&url);
-        self.title = url;
-        self
-    }
-
-    /// Navigate to `url`, updating title from the URL string.
-    pub fn navigate(&mut self, url: String) {
-        self.title = url.chars().take(32).collect();
-        self.url = url;
-    }
-
-    /// Reset to an empty new-tab state.
-    pub fn reset(&mut self) {
-        self.url = String::new();
-        self.title = "New Tab".to_string();
-    }
-}
-
-/// A bookmarked URL.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Bookmark {
-    pub id: i64,
-    pub title: String,
-    pub url: String,
-    pub created_at: String,
-}
-
-/// A history entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HistoryEntry {
-    pub id: i64,
-    pub title: String,
-    pub url: String,
-    pub visited_at: String,
-}
-
-/// A download tracked by the browser.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DownloadEntry {
-    pub id: i64,
-    pub filename: String,
-    pub url: String,
-    /// S3 destination path (e.g. `/shared/downloads/file.zip`).
-    pub s3_path: String,
-    pub status: DownloadStatus,
-    pub started_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum DownloadStatus {
-    Pending,
-    Saving,
-    Done,
-    Error(String),
-}
-
-impl DownloadStatus {
-    #[must_use]
-    pub fn label(&self) -> &str {
-        match self {
-            Self::Pending => "Pending",
-            Self::Saving => "Saving…",
-            Self::Done => "Done",
-            Self::Error(_) => "Error",
+        self.current_url = Some(url.clone());
+        self.loading = true;
+        if let Ok(parsed) = fs_web_engine::WebUrl::parse(&url) {
+            self.history.push(parsed);
         }
     }
+
+    /// Record that the current page finished loading.
+    pub fn set_loaded(&mut self, title: Option<String>) {
+        self.loading = false;
+        self.current_title = title;
+    }
+
+    /// Record a load failure (stop spinner, keep URL).
+    pub fn set_load_error(&mut self) {
+        self.loading = false;
+    }
+
+    /// Update the current URL (e.g. after a redirect).
+    pub fn set_current_url(&mut self, url: impl Into<String>) {
+        self.current_url = Some(url.into());
+    }
+}
+
+// ── HistoryEntry ──────────────────────────────────────────────────────────────
+
+/// A single item in the browser's navigation history as reported to the UI /
+/// gRPC layer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct HistoryEntry {
+    /// The URL that was visited.
+    pub url: String,
+    /// RFC-3339 timestamp of the visit.
+    pub visited_at: String,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -101,43 +79,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_tab_is_empty() {
-        let tab = BrowserTab::new(1);
-        assert_eq!(tab.id, 1);
-        assert!(tab.url.is_empty());
-        assert_eq!(tab.title, "New Tab");
-        assert!(!tab.loading);
+    fn new_model_is_empty() {
+        let m = BrowserModel::new();
+        assert!(m.current_url.is_none());
+        assert!(m.current_title.is_none());
+        assert!(!m.loading);
+        assert!(m.history.is_empty());
     }
 
     #[test]
-    fn with_url_sets_title_and_url() {
-        let tab = BrowserTab::new(1).with_url("https://example.com");
-        assert_eq!(tab.url, "https://example.com");
-        assert_eq!(tab.title, "https://example.com");
+    fn set_loading_updates_state() {
+        let mut m = BrowserModel::new();
+        m.set_loading("https://example.com");
+        assert_eq!(m.current_url.as_deref(), Some("https://example.com"));
+        assert!(m.loading);
     }
 
     #[test]
-    fn navigate_truncates_title_to_32_chars() {
-        let mut tab = BrowserTab::new(1);
-        let long_url = "https://example.com/very/long/path/that/exceeds/32/chars";
-        tab.navigate(long_url.to_string());
-        assert_eq!(tab.url, long_url);
-        assert!(tab.title.chars().count() <= 32);
+    fn set_loaded_clears_spinner() {
+        let mut m = BrowserModel::new();
+        m.set_loading("https://example.com");
+        m.set_loaded(Some("Example".into()));
+        assert!(!m.loading);
+        assert_eq!(m.current_title.as_deref(), Some("Example"));
     }
 
     #[test]
-    fn reset_clears_tab() {
-        let mut tab = BrowserTab::new(1).with_url("https://example.com");
-        tab.reset();
-        assert!(tab.url.is_empty());
-        assert_eq!(tab.title, "New Tab");
+    fn set_load_error_clears_spinner() {
+        let mut m = BrowserModel::new();
+        m.set_loading("https://bad.example");
+        m.set_load_error();
+        assert!(!m.loading);
+        // URL is preserved so the user sees what failed.
+        assert_eq!(m.current_url.as_deref(), Some("https://bad.example"));
     }
 
     #[test]
-    fn download_status_labels() {
-        assert_eq!(DownloadStatus::Pending.label(), "Pending");
-        assert_eq!(DownloadStatus::Saving.label(), "Saving\u{2026}");
-        assert_eq!(DownloadStatus::Done.label(), "Done");
-        assert_eq!(DownloadStatus::Error("oops".into()).label(), "Error");
+    fn history_grows_on_navigation() {
+        let mut m = BrowserModel::new();
+        m.set_loading("https://a.com");
+        m.set_loaded(None);
+        m.set_loading("https://b.com");
+        m.set_loaded(None);
+        assert_eq!(m.history.len(), 2);
+        assert!(m.history.can_go_back());
     }
 }

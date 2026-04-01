@@ -2,8 +2,8 @@
 
 ## What is this?
 
-FreeSynergy Browser — embedded web browser with tabs, bookmarks, history, and S3 downloads.
-Runs standalone or embedded inside the FreeSynergy Desktop shell (`fs-gui-workspace`).
+FreeSynergy Browser — web browser with WebEngine abstraction, bookmarks, and history.
+Runs inside the FreeSynergy Desktop shell or standalone.
 
 ## Rules
 
@@ -13,23 +13,30 @@ Runs standalone or embedded inside the FreeSynergy Desktop shell (`fs-gui-worksp
 - No CHANGELOG.md
 - After every feature: commit directly
 
+## Quality Gates (before every commit)
+
+```
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo test
+```
+
 ## Architecture
 
-Follows the Provider Pattern (OOP, Dioxus):
-- `BrowserApp` is the root component
-- `BrowserConfig` / `SearchEngineRegistry` handle configuration
-- `BookmarkManager` owns all bookmark/history CRUD
-- `BrowserUrlRequest` context allows external callers (e.g. Conductor) to open URLs
+MVC pattern — all components stay renderer-agnostic:
 
-## Dependencies
+- `BrowserModel`      — observable state (URL, title, loading, history, bookmarks)
+- `BrowserController` — navigation + bookmark logic (knows only `WebEngine` + `BookmarkStore` traits)
+- `BrowserView`       — `FsView` impl in `view.rs` (the ONLY file that imports `fs-render`)
 
-- **fs-libs** (`../fs-libs/`) — `fs-components`, `fs-i18n`
-- **fs-desktop** (`../fs-desktop/vendor/dioxus-desktop`) — patched Dioxus desktop
+Supporting:
+- `NavigationHistory` — composite back/forward stack (from `fs-web-engine`)
+- `BookmarkStore`     — repository trait, `InMemoryBookmarkStore` for testing
+- `keys.rs`           — FTL key constants (all user-visible strings translated via `fs-i18n`)
+- `cli.rs`            — clap CLI: `open`, `history`, `bookmarks list|add|remove`
+- `grpc.rs`           — tonic gRPC server: Open/Navigate/History/Bookmarks/Health
+- `rest.rs`           — axum REST + OpenAPI via utoipa
 
-## CSS Variables Prefix
+## FTL
 
-Always `--fs-` (e.g., `--fs-color-primary`, `--fs-font-family`).
-
-## Config path
-
-`~/.config/fsn/browser.toml`
+Keys are in `fs-i18n/locales/{lang}/browser.ftl`.
