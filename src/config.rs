@@ -85,6 +85,9 @@ impl BrowserConfig {
     pub fn load() -> Self {
         Self::default()
     }
+
+    /// Persist the current config.  No-op until a config backend is wired up.
+    pub fn save(&self) {}
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
